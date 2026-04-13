@@ -50,6 +50,8 @@ ENV ACESTEP_AUDIO_FORMAT=mp3
 ENV ACESTEP_QUANTIZATION=
 ENV LORA_WEIGHT=0.8
 ENV PYTHONUNBUFFERED=1
+# RunPod init timeout: model download from HuggingFace on first cold start needs time
+ENV RUNPOD_INIT_TIMEOUT=600
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 CMD ["python", "-u", "handler.py"]
