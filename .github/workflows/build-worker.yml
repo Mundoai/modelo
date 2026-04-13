@@ -29,8 +29,11 @@ jobs:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY"
+                      /opt/hostedtoolcache /usr/share/swift /usr/local/graalvm \
+                      /usr/local/.ghcup /usr/local/share/powershell \
+                      /usr/local/share/chromium /usr/local/lib/node_modules
           sudo docker image prune -af
+          sudo apt-get clean
           df -h
 
       - name: Checkout
