@@ -43,7 +43,8 @@ ENV CHECKPOINTS_DIR=/runpod-volume/checkpoints
 
 # ── Default env (XL-Turbo defaults) ──────────────────────────────────────────
 ENV ACESTEP_DIT_MODEL=acestep-v15-xl-turbo
-ENV ACESTEP_LM_MODEL=acestep-5Hz-lm-4B
+# LM Planner disabled — lyrics come from Groq/DeepInfra/OpenRouter/RunPod LLM endpoint chain
+ENV ACESTEP_LM_MODEL=
 ENV ACESTEP_CPU_OFFLOAD=false
 ENV ACESTEP_AUDIO_FORMAT=mp3
 ENV ACESTEP_QUANTIZATION=
