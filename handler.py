@@ -604,15 +604,6 @@ def handler(job):
                 # V3: Don't let LM rewrite our vocal-centric caption or override language
                 use_cot_caption=False,
                 use_cot_language=False,
-                # V3: Windowed attention tuning for better lyric alignment
-                use_windowed_attention=use_windowed_attention,
-                guidance_steps_pct=0.75,      # Apply windowed attention for 75% of steps (was 50%)
-                soft_mask_value=3.5,           # Stronger attention bias toward in-window positions (was 2.0)
-                window_margin_ratio=0.2,       # Tighter windows, less bleed between sections (was 0.3)
-                # V3: Tighter LM planner — more deterministic audio code generation
-                lm_temperature=0.6,            # Was 0.85 — less random, more predictable lyric placement
-                lm_cfg_scale=3.0,              # Was 2.0 — LM follows lyrics more strictly
-                lm_top_p=0.8,                  # Was 0.9 — narrower sampling
                 reference_audio=local_ref_audio,
                 src_audio=local_src_audio,
                 audio_cover_strength=audio_cover_strength,
