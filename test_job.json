@@ -1,0 +1,17 @@
+{
+  "input": {
+    "prompt": "salsa cubana, brass section, conga drums, piano guajeo, bass tumbao, 170 bpm, energetic, festive, Spanish vocals",
+    "lyrics": "[verse]\nBajo el sol de la Habana brillante\nLa música corre por mis venas\nCon ritmo de son y de clave\nSe enciende la noche cubana\n\n[chorus]\nBailamos hasta el amanecer\nCon la salsa en el corazón\nQue la vida es para gozar\nY el ritmo no tiene final",
+    "duration": 60.0,
+    "quality": "standard",
+    "vocal_language": "es",
+    "vocal_gender": "male",
+    "vocal_timbre": "carlos",
+    "creativity": 50,
+    "bpm": 170,
+    "key_scale": "A minor",
+    "time_signature": "4",
+    "seed": 42,
+    "use_windowed_attention": true
+  }
+}
