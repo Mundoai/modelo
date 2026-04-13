@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Model weights (downloaded at runtime or baked via Dockerfile)
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+!ace-step-1.5/**/silence_latent.pt
+
+# Environment
+.env
+.env.*
+*.log
+
+# IDE
+.vscode/
+.idea/
