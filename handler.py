@@ -163,6 +163,11 @@ def _setup_volume_symlink():
     package_checkpoints = os.path.join(ACESTEP_DIR, "checkpoints")
     volume_checkpoints  = os.path.join(CHECKPOINTS_DIR, "")   # e.g. /runpod-volume/checkpoints
 
+    # Same path (no volume) → nothing to do.
+    if os.path.realpath(package_checkpoints) == os.path.realpath(volume_checkpoints.rstrip("/")):
+        logger.info(f"[setup] Checkpoints dir is already the target — no symlink needed")
+        return
+
     # Already a symlink → nothing to do.
     if os.path.islink(package_checkpoints):
         logger.info(f"[setup] Checkpoints symlink already in place: {package_checkpoints}")
