@@ -198,6 +198,95 @@ def _setup_volume_symlink():
     logger.info(f"[setup] Symlinked {package_checkpoints} → {volume_checkpoints}")
 
 
+def _download_models_from_r2(checkpoint_path: "Path", missing: list):
+    """Download model components from R2 bucket (models/ prefix).
+
+    R2 advantages over HuggingFace:
+    - No download cache overhead (direct file copy, not HF hub cache)
+    - No rate limits
+    - Uses existing S3_* credentials already in env
+    - Faster: R2 egress is free, closer to RunPod DCs
+    """
+    import boto3
+    from boto3.s3.transfer import TransferConfig
+
+    if not S3_ENDPOINT or not S3_ACCESS_KEY:
+        raise RuntimeError("S3/R2 credentials not configured")
+
+    s3 = boto3.client("s3",
+        endpoint_url=S3_ENDPOINT,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
+        region_name=S3_REGION,
+    )
+    config = TransferConfig(
+        multipart_threshold=50 * 1024 * 1024,
+        multipart_chunksize=50 * 1024 * 1024,
+        max_concurrency=10,
+        use_threads=True,
+    )
+
+    for component in missing:
+        prefix = f"models/{component}/"
+        logger.info(f"[init] Downloading {component} from R2 ({prefix})...")
+        dest = checkpoint_path / component
+        dest.mkdir(parents=True, exist_ok=True)
+
+        # List all files for this component
+        paginator = s3.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix)
+        file_count = 0
+        for page in pages:
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                fname = key[len(prefix):]
+                if not fname or fname.endswith("/"):
+                    continue
+                local_path = dest / fname
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                size_mb = obj["Size"] / 1e6
+                logger.info(f"[init]   {fname} ({size_mb:.0f}MB)")
+                s3.download_file(S3_BUCKET, key, str(local_path), Config=config)
+                file_count += 1
+
+        if file_count == 0:
+            raise RuntimeError(f"No files found in R2 at {prefix}")
+        logger.info(f"[init] {component}: {file_count} files downloaded from R2")
+
+    logger.info("[init] All models downloaded from R2")
+
+
+def _download_models_from_hf(checkpoint_path: "Path", missing: list):
+    """Fallback: download from HuggingFace if R2 is unavailable."""
+    from huggingface_hub import snapshot_download as _hf_download
+    from acestep.model_downloader import SUBMODEL_REGISTRY, MAIN_MODEL_REPO
+
+    _main_components = {"vae", "Qwen3-Embedding-0.6B"}
+    _main_missing = [c for c in missing if c in _main_components]
+    _sub_missing = [c for c in missing if c not in _main_components]
+
+    if _main_missing:
+        _allow = [f"{comp}/**" for comp in _main_missing]
+        logger.info(f"[init] HF fallback — main repo: {_main_missing}")
+        _hf_download(
+            repo_id=MAIN_MODEL_REPO,
+            local_dir=str(checkpoint_path),
+            local_dir_use_symlinks=False,
+            allow_patterns=_allow,
+        )
+
+    for sub_name in _sub_missing:
+        if sub_name in SUBMODEL_REGISTRY:
+            sub_repo = SUBMODEL_REGISTRY[sub_name]
+            sub_dest = checkpoint_path / sub_name
+            logger.info(f"[init] HF fallback — {sub_name} from {sub_repo}")
+            _hf_download(repo_id=sub_repo, local_dir=str(sub_dest), local_dir_use_symlinks=False)
+        else:
+            logger.warning(f"[init] Unknown component {sub_name}")
+
+    logger.info("[init] HF fallback download complete")
+
+
 def initialize_model():
     """
     Cold start: load ACE-Step 1.5 model into GPU memory.
@@ -242,55 +331,22 @@ def initialize_model():
                 CPU_OFFLOAD = _CPU_OFFLOAD_ENV == "true"
                 logger.info(f"[init] CPU_OFFLOAD={CPU_OFFLOAD} (from env)")
 
-        # ── Model download check (volume path) ───────────────────────────
-        # Check required components: DiT + VAE + Embedding + LM (if enabled).
-        # Only downloads the specific LM model needed, skips all others.
+        # ── Model download check ─────────────────────────────────────────
+        # Downloads from R2 (same bucket as audio uploads). Falls back to
+        # HuggingFace if R2 files are missing. R2 is faster (no HF rate
+        # limits, no cache overhead) and uses existing S3 credentials.
         checkpoint_path = Path(CHECKPOINTS_DIR)
         _required = [DIT_MODEL, "vae", "Qwen3-Embedding-0.6B"]
         if LM_MODEL:
             _required.append(LM_MODEL)
         _missing = [c for c in _required if not (checkpoint_path / c).exists()]
         if _missing:
-            logger.info(f"[init] Missing components: {_missing} — downloading from HuggingFace...")
+            logger.info(f"[init] Missing components: {_missing}")
             try:
-                from huggingface_hub import snapshot_download as _hf_download
-                from acestep.model_downloader import SUBMODEL_REGISTRY, MAIN_MODEL_REPO
-
-                # Components from the main repo (vae, embedding only — DiT comes from sub-model)
-                _main_components = {"vae", "Qwen3-Embedding-0.6B"}
-                _main_missing = [c for c in _missing if c in _main_components]
-                _sub_missing = [c for c in _missing if c not in _main_components]
-
-                # Download ONLY the needed components from main repo (not the entire repo)
-                if _main_missing:
-                    _allow = []
-                    for comp in _main_missing:
-                        _allow.append(f"{comp}/**")
-                    logger.info(f"[init] Downloading from main repo: {_main_missing} (allow={_allow})")
-                    _hf_download(
-                        repo_id=MAIN_MODEL_REPO,
-                        local_dir=str(checkpoint_path),
-                        local_dir_use_symlinks=False,
-                        allow_patterns=_allow,
-                    )
-
-                # Download sub-model repo components (XL DiT, extra LMs, etc.)
-                for sub_name in _sub_missing:
-                    if sub_name in SUBMODEL_REGISTRY:
-                        sub_repo = SUBMODEL_REGISTRY[sub_name]
-                        sub_dest = checkpoint_path / sub_name
-                        logger.info(f"[init] Downloading sub-model {sub_name} from {sub_repo}")
-                        _hf_download(
-                            repo_id=sub_repo,
-                            local_dir=str(sub_dest),
-                            local_dir_use_symlinks=False,
-                        )
-                    else:
-                        logger.warning(f"[init] Unknown component {sub_name} — not in registry, skipping")
-
-                logger.info("[init] Model download complete")
-            except Exception as dl_err:
-                raise RuntimeError(f"Model download failed: {dl_err}") from dl_err
+                _download_models_from_r2(checkpoint_path, _missing)
+            except Exception as r2_err:
+                logger.warning(f"[init] R2 download failed: {r2_err} — falling back to HuggingFace")
+                _download_models_from_hf(checkpoint_path, _missing)
 
         # ── GPU config ────────────────────────────────────────────────────
         gpu_config = get_gpu_config()
