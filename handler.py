@@ -256,27 +256,22 @@ def initialize_model():
                 from huggingface_hub import snapshot_download as _hf_download
                 from acestep.model_downloader import SUBMODEL_REGISTRY, MAIN_MODEL_REPO
 
-                # Components from the main repo (vae, embedding, default turbo, default LM)
-                _main_components = {"acestep-v15-turbo", "vae", "Qwen3-Embedding-0.6B", "acestep-5Hz-lm-1.7B"}
+                # Components from the main repo (vae, embedding only — DiT comes from sub-model)
+                _main_components = {"vae", "Qwen3-Embedding-0.6B"}
                 _main_missing = [c for c in _missing if c in _main_components]
                 _sub_missing = [c for c in _missing if c not in _main_components]
 
-                # Download main repo components (if any are missing)
+                # Download ONLY the needed components from main repo (not the entire repo)
                 if _main_missing:
-                    _all_lm = ["acestep-5Hz-lm-0.6B", "acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-4B"]
-                    _ignore = ["*.gitattributes"]
-                    if LM_MODEL:
-                        for lm in _all_lm:
-                            if lm != LM_MODEL:
-                                _ignore.append(f"{lm}/**")
-                    else:
-                        _ignore.append("acestep-5Hz-lm-*/**")
-                    logger.info(f"[init] Downloading main repo components: {_main_missing}")
+                    _allow = []
+                    for comp in _main_missing:
+                        _allow.append(f"{comp}/**")
+                    logger.info(f"[init] Downloading from main repo: {_main_missing} (allow={_allow})")
                     _hf_download(
                         repo_id=MAIN_MODEL_REPO,
                         local_dir=str(checkpoint_path),
                         local_dir_use_symlinks=False,
-                        ignore_patterns=_ignore,
+                        allow_patterns=_allow,
                     )
 
                 # Download sub-model repo components (XL DiT, extra LMs, etc.)
