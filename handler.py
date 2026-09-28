@@ -49,6 +49,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("lamusica.worker")
+_PROCESS_START = time.time()
 
 # ── ACE-Step path ─────────────────────────────────────────────────────────────
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -97,7 +98,13 @@ QUALITY_PRESETS = {
 _dit_handler = None
 _llm_handler = None
 _initialized = False
-_init_error = None
+
+# Cold-start download tuning (R2 → container disk)
+R2_FILE_CONCURRENCY = int(os.environ.get("R2_FILE_CONCURRENCY", "8"))
+R2_PART_CONCURRENCY = int(os.environ.get("R2_PART_CONCURRENCY", "16"))
+# Written into a component dir only after all its files landed, so an
+# interrupted download is re-fetched instead of loaded half-written.
+COMPLETE_MARKER = ".download_complete"
 
 
 def _creativity_to_guidance(creativity: int) -> float:
@@ -225,40 +232,56 @@ def _download_models_from_r2(checkpoint_path: "Path", missing: list):
         region_name=S3_REGION,
     )
     config = TransferConfig(
-        multipart_threshold=50 * 1024 * 1024,
-        multipart_chunksize=50 * 1024 * 1024,
-        max_concurrency=10,
+        multipart_threshold=32 * 1024 * 1024,
+        multipart_chunksize=32 * 1024 * 1024,
+        max_concurrency=R2_PART_CONCURRENCY,
         use_threads=True,
     )
 
+    # List every file of every missing component first, then download them
+    # all at once — previously components and files went strictly one by one.
+    import shutil
+    files = []  # (component, key, local_path, size)
     for component in missing:
         prefix = f"models/{component}/"
-        logger.info(f"[init] Downloading {component} from R2 ({prefix})...")
         dest = checkpoint_path / component
+        if dest.exists():
+            shutil.rmtree(dest)  # leftover from an interrupted download
         dest.mkdir(parents=True, exist_ok=True)
-
-        # List all files for this component
         paginator = s3.get_paginator("list_objects_v2")
-        pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix)
-        file_count = 0
-        for page in pages:
+        count = 0
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
             for obj in page.get("Contents", []):
-                key = obj["Key"]
-                fname = key[len(prefix):]
+                fname = obj["Key"][len(prefix):]
                 if not fname or fname.endswith("/"):
                     continue
                 local_path = dest / fname
                 local_path.parent.mkdir(parents=True, exist_ok=True)
-                size_mb = obj["Size"] / 1e6
-                logger.info(f"[init]   {fname} ({size_mb:.0f}MB)")
-                s3.download_file(S3_BUCKET, key, str(local_path), Config=config)
-                file_count += 1
-
-        if file_count == 0:
+                files.append((component, obj["Key"], local_path, obj["Size"]))
+                count += 1
+        if count == 0:
             raise RuntimeError(f"No files found in R2 at {prefix}")
-        logger.info(f"[init] {component}: {file_count} files downloaded from R2")
+        logger.info(f"[init] {component}: {count} files queued from R2")
 
-    logger.info("[init] All models downloaded from R2")
+    total_bytes = sum(f[3] for f in files)
+    t0 = time.time()
+
+    def _fetch(item):
+        _, key, local_path, _ = item
+        s3.download_file(S3_BUCKET, key, str(local_path), Config=config)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=R2_FILE_CONCURRENCY) as pool:
+        for fut in concurrent.futures.as_completed([pool.submit(_fetch, f) for f in files]):
+            fut.result()
+
+    for component in missing:
+        (checkpoint_path / component / COMPLETE_MARKER).touch()
+
+    elapsed = time.time() - t0
+    logger.info(
+        f"[timing] r2_download {total_bytes / 1e9:.2f}GB in {elapsed:.1f}s "
+        f"({total_bytes / 1e6 / max(elapsed, 0.001):.0f} MB/s, {len(files)} files)"
+    )
 
 
 def _download_models_from_hf(checkpoint_path: "Path", missing: list):
@@ -289,6 +312,9 @@ def _download_models_from_hf(checkpoint_path: "Path", missing: list):
         else:
             logger.warning(f"[init] Unknown component {sub_name}")
 
+    for component in missing:
+        if (checkpoint_path / component).is_dir():
+            (checkpoint_path / component / COMPLETE_MARKER).touch()
     logger.info("[init] HF fallback download complete")
 
 
@@ -297,7 +323,7 @@ def initialize_model():
     Cold start: load ACE-Step 1.5 model into GPU memory.
     Called once per worker lifecycle. Subsequent jobs reuse the warm model.
     """
-    global _dit_handler, _llm_handler, _initialized, _init_error
+    global _dit_handler, _llm_handler, _initialized
 
     if _initialized:
         return
@@ -344,7 +370,7 @@ def initialize_model():
         _required = [DIT_MODEL, "vae", "Qwen3-Embedding-0.6B"]
         if LM_MODEL:
             _required.append(LM_MODEL)
-        _missing = [c for c in _required if not (checkpoint_path / c).exists()]
+        _missing = [c for c in _required if not (checkpoint_path / c / COMPLETE_MARKER).exists()]
         if _missing:
             logger.info(f"[init] Missing components: {_missing}")
             try:
@@ -352,6 +378,8 @@ def initialize_model():
             except Exception as r2_err:
                 logger.warning(f"[init] R2 download failed: {r2_err} — falling back to HuggingFace")
                 _download_models_from_hf(checkpoint_path, _missing)
+
+        logger.info(f"[timing] weights_on_disk at {time.time() - start:.1f}s into init")
 
         # ── GPU config ────────────────────────────────────────────────────
         gpu_config = get_gpu_config()
@@ -405,10 +433,12 @@ def initialize_model():
 
         _initialized = True
         logger.info(f"[init] ACE-Step ready in {time.time() - start:.1f}s")
+        logger.info(f"[timing] ready {time.time() - _PROCESS_START:.1f}s after process start")
 
     except Exception as e:
-        _init_error = str(e)
-        _initialized = True   # Mark done so we don't retry and block
+        # Leave _initialized False so the next job retries init. Setting it
+        # True here bricked the warm worker for its whole lifetime.
+        _dit_handler = None
         logger.error(f"[init] FAILED: {e}")
         raise
 
@@ -467,8 +497,10 @@ def handler(job):
         except Exception as e:
             return {"error": f"Model initialization failed: {e}"}
 
-    if _init_error:
-        return {"error": f"Model in failed state: {_init_error}"}
+    # ── Warmup ping — model is loaded, no generation, no GPU work ────────────
+    if input_data.get("warmup"):
+        logger.info(f"[job:{job_id}] Warmup ping — worker ready, skipping generation")
+        return {"warmup": True, "status": "ready"}
 
     # ── Parse input ───────────────────────────────────────────────────────────
     prompt = input_data.get("prompt", "")

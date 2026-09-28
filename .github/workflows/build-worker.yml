@@ -57,8 +57,9 @@ jobs:
           context: .
           file: Dockerfile
           push: true
+          # v1.0.0 only moves on main; branch builds publish their SHA tag only
           tags: |
-            ghcr.io/${{ env.OWNER }}/lamusica-xl-worker:v1.0.0
+            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/lamusica-xl-worker:v1.0.0', env.OWNER) || '' }}
             ghcr.io/${{ env.OWNER }}/lamusica-xl-worker:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
