@@ -8,6 +8,10 @@ name: Build XL-Turbo Worker
 
 on:
   workflow_dispatch:
+    inputs:
+      dockerfile:
+        description: "Dockerfile to build (Dockerfile.handler = handler-only layer on the live image)"
+        default: Dockerfile
   push:
     branches: [main]
 
@@ -55,7 +59,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile
+          file: ${{ inputs.dockerfile || 'Dockerfile' }}
           push: true
           # v1.0.0 only moves on main; branch builds publish their SHA tag only
           tags: |

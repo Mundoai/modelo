@@ -1,0 +1,6 @@
+# Handler-only update on top of the live, known-good worker image.
+# Keeps every dependency byte-identical to prod (requirements.txt is unpinned
+# and flash-attn no longer has a prebuilt wheel, so a full rebuild drifts).
+ARG BASE_IMAGE=ghcr.io/mundoai/lamusica-xl-worker:78efab9cd7875c3d5c7d60003dc4bc169cc17c33
+FROM ${BASE_IMAGE}
+COPY handler.py /app/handler.py
