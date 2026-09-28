@@ -284,6 +284,14 @@ def _download_models_from_r2(checkpoint_path: "Path", missing: list):
     )
 
 
+# HF commits whose files are byte-identical to our R2 copy (sha256-verified 2026-09-28).
+# Pinned so an upstream push can never make HF-fallback workers load different weights.
+_HF_REVISIONS = {
+    "ACE-Step/Ace-Step1.5": "19671f406d603126926c1b7e2adc169acbcade22",
+    "ACE-Step/acestep-v15-xl-turbo": "d4a0b288b83ebb7e25a8c0b32c573c22e134e8ee",
+}
+
+
 def _download_models_from_hf(checkpoint_path: "Path", missing: list):
     """Fallback: download from HuggingFace if R2 is unavailable."""
     from huggingface_hub import snapshot_download as _hf_download
@@ -298,6 +306,7 @@ def _download_models_from_hf(checkpoint_path: "Path", missing: list):
         logger.info(f"[init] HF fallback — main repo: {_main_missing}")
         _hf_download(
             repo_id=MAIN_MODEL_REPO,
+            revision=_HF_REVISIONS.get(MAIN_MODEL_REPO),
             local_dir=str(checkpoint_path),
             local_dir_use_symlinks=False,
             allow_patterns=_allow,
@@ -308,7 +317,8 @@ def _download_models_from_hf(checkpoint_path: "Path", missing: list):
             sub_repo = SUBMODEL_REGISTRY[sub_name]
             sub_dest = checkpoint_path / sub_name
             logger.info(f"[init] HF fallback — {sub_name} from {sub_repo}")
-            _hf_download(repo_id=sub_repo, local_dir=str(sub_dest), local_dir_use_symlinks=False)
+            _hf_download(repo_id=sub_repo, revision=_HF_REVISIONS.get(sub_repo),
+                         local_dir=str(sub_dest), local_dir_use_symlinks=False)
         else:
             logger.warning(f"[init] Unknown component {sub_name}")
 
@@ -387,6 +397,14 @@ def initialize_model():
         logger.info(f"[init] GPU tier: {gpu_config.tier}, max duration: {gpu_config.max_duration_without_lm}s")
 
         # ── DiT handler ───────────────────────────────────────────────────
+        # Upstream initialize_service treats the 2B turbo DiT + 5Hz LM as part of the
+        # "main model" and, finding them absent, snapshot_downloads all of
+        # ACE-Step/Ace-Step1.5 (~10 GB, unpinned) on EVERY cold start (~29 s of paid
+        # GPU time, plus a hard HF dependency). We load neither; vae + Qwen3 are
+        # already on disk from R2 and byte-identical to HF. Check only what we use.
+        import acestep.model_downloader as _md
+        _md.MAIN_MODEL_COMPONENTS[:] = ["vae", "Qwen3-Embedding-0.6B"]
+
         _dit_handler = AceStepHandler()
         project_root = ACESTEP_DIR if os.path.isdir(ACESTEP_DIR) else os.path.dirname(CHECKPOINTS_DIR)
         _use_compile = bool(QUANTIZATION)  # torchao INT8 requires torch.compile
