@@ -493,9 +493,9 @@ def upload_to_s3(local_path: str, object_key: str) -> str:
     return url
 
 
-def handler(job):
+def _handle_job(job):
     """
-    RunPod serverless handler. Called for every generation job.
+    Runs one generation job (wrapped by `handler`, which adds the VRAM floor check).
 
     Args:
         job: dict with keys "id" and "input"
@@ -889,6 +889,49 @@ def handler(job):
             "bpm": bpm,
         },
     }
+
+
+# ── VRAM floor ────────────────────────────────────────────────────────────────
+# A caught CUDA OOM (2026-10-25: the lyric scorer on 240 s + very long lyrics) can strand
+# tens of GB on a warm worker; every later job then fails its VRAM pre-flight. A healthy
+# XL worker idles at ~33 GB effective free on a 48 GB card, so 16 GB means something is
+# stranded. Normal jobs do no cleanup work — only a worker already below the floor does.
+VRAM_FLOOR_GB = 16.0
+
+
+def _below_vram_floor(job_id):
+    """True when effective free VRAM is under the floor even after releasing unreferenced
+    tensors once — the caller then asks RunPod for a fresh worker."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        from acestep.gpu_config import get_effective_free_vram_gb
+        free_gb = get_effective_free_vram_gb()
+        if free_gb >= VRAM_FLOOR_GB:
+            return False
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        after_gb = get_effective_free_vram_gb()
+        logger.warning(
+            f"[job:{job_id}] VRAM floor: {free_gb:.1f} GB free < {VRAM_FLOOR_GB:.0f} GB; "
+            f"after release {after_gb:.1f} GB"
+            + (" — refreshing worker" if after_gb < VRAM_FLOOR_GB else " — recovered")
+        )
+        return after_gb < VRAM_FLOOR_GB
+    except Exception as e:
+        logger.warning(f"[job:{job_id}] VRAM floor check failed: {e}")
+        return False
+
+
+def handler(job):
+    """RunPod serverless handler. Returns the job result; adds `refresh_worker` (the SDK
+    stops this worker after delivering the result) when VRAM stays below the floor."""
+    result = _handle_job(job)
+    if isinstance(result, dict) and _below_vram_floor(job.get("id", "unknown")):
+        result["refresh_worker"] = True
+    return result
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
