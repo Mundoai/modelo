@@ -52,7 +52,7 @@ class VramFloor(unittest.TestCase):
         self.torch.cuda.empty_cache.assert_not_called()
 
     def test_below_floor_but_recovers_after_release(self):
-        out = self.run_handler([5.7, 33.0], {"audio_url": "u"})
+        out = self.run_handler([3.0, 33.0], {"audio_url": "u"})
         self.assertNotIn("refresh_worker", out)
         self.gc.assert_called_once()
         self.torch.cuda.empty_cache.assert_called_once()
@@ -67,8 +67,13 @@ class VramFloor(unittest.TestCase):
         self.assertTrue(out["refresh_worker"])
 
     def test_exactly_at_floor_is_healthy(self):
-        out = self.run_handler([16.0], {"audio_url": "u"})
+        out = self.run_handler([5.0], {"audio_url": "u"})
         self.assertNotIn("refresh_worker", out)
+
+    def test_between_old_and_new_floor_is_healthy(self):
+        out = self.run_handler([5.7], {"audio_url": "u"})
+        self.assertNotIn("refresh_worker", out)
+        self.gc.assert_not_called()
 
     def test_no_cuda_never_refreshes(self):
         self.torch.cuda.is_available.return_value = False

@@ -894,9 +894,10 @@ def _handle_job(job):
 # ── VRAM floor ────────────────────────────────────────────────────────────────
 # A caught CUDA OOM (2026-10-25: the lyric scorer on 240 s + very long lyrics) can strand
 # tens of GB on a warm worker; every later job then fails its VRAM pre-flight. A healthy
-# XL worker idles at ~33 GB effective free on a 48 GB card, so 16 GB means something is
-# stranded. Normal jobs do no cleanup work — only a worker already below the floor does.
-VRAM_FLOOR_GB = 16.0
+# XL worker idles at ~33 GB effective free on a 48 GB card; the largest job (240 s) needs
+# ~2.5 GB at pre-flight, so 5 GB = 2x that. Below it the next job is at risk.
+# Normal jobs do no cleanup work — only a worker already below the floor does.
+VRAM_FLOOR_GB = 5.0
 
 
 def _below_vram_floor(job_id):
