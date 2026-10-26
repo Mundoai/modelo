@@ -541,6 +541,12 @@ def _handle_job(job):
     task_type = input_data.get("task_type", "text2music")
     src_audio_url = input_data.get("src_audio_url")         # presigned URL for source song (cover mode)
     audio_cover_strength = float(input_data.get("audio_cover_strength", 0.8))
+    # Replace Section (repaint): re-sing [repaint_start, repaint_end] of src audio,
+    # keep everything outside it (engine pastes the source waveform back).
+    repaint_start = float(input_data.get("repainting_start") or 0.0)
+    repaint_end = float(input_data.get("repainting_end") or 0.0)
+    if task_type == "repaint" and not (0.0 <= repaint_start < repaint_end):
+        return {"error": "repaint requires 0 <= repainting_start < repainting_end"}
 
     if not prompt:
         return {"error": "prompt is required"}
@@ -618,7 +624,22 @@ def _handle_job(job):
 
             # Download source audio for cover mode (if provided)
             local_src_audio = None
-            if src_audio_url and task_type == "cover":
+            if task_type == "repaint":
+                # Replace Section: the source song is mandatory. Never fall back to
+                # text2music — that would bill a brand-new song nobody asked for.
+                if not src_audio_url:
+                    return {"error": "repaint requires src_audio_url", "generation_time": 0}
+                import urllib.request
+                src_path = os.path.join(tmpdir, "source_audio.mp3")
+                urllib.request.urlretrieve(src_audio_url, src_path)
+                if os.path.getsize(src_path) < 10_000:
+                    return {"error": "repaint source audio too small", "generation_time": 0}
+                local_src_audio = src_path
+                logger.info(
+                    f"[job:{job_id}] repaint src={os.path.getsize(src_path)//1024}KB "
+                    f"region={repaint_start:.2f}-{repaint_end:.2f}s"
+                )
+            elif src_audio_url and task_type == "cover":
                 try:
                     import urllib.request
                     src_path = os.path.join(tmpdir, "source_audio.mp3")
@@ -657,7 +678,11 @@ def _handle_job(job):
                 reference_audio=local_ref_audio,
                 src_audio=local_src_audio,
                 audio_cover_strength=audio_cover_strength,
+                **(_repaint_kwargs(repaint_start, repaint_end) if task_type == "repaint" else {}),
             )
+
+            if task_type == "repaint":
+                return _run_repaint_takes(job_id, params, tmpdir, gen_start, repaint_start, repaint_end)
 
             # Load per-job LoRA if requested
             if job_lora_path and job_lora_path != LORA_PATH:
@@ -924,6 +949,52 @@ def _below_vram_floor(job_id):
     except Exception as e:
         logger.warning(f"[job:{job_id}] VRAM floor check failed: {e}")
         return False
+
+
+REPAINT_TAKES = 2  # Suno/Udio parity: two takes to pick from
+
+
+def _repaint_kwargs(start: float, end: float) -> dict:
+    """Max-preservation repaint: explicit 0/1 region mask, conservative mode
+    (step injection 1.0 + 1 s latent xfade + 50 ms waveform splice outside region)."""
+    return {
+        "repainting_start": float(start),
+        "repainting_end": float(end),
+        "chunk_mask_mode": "explicit",
+        "repaint_mode": "conservative",
+        "repaint_strength": 0.0,  # unused in conservative mode
+    }
+
+
+def _run_repaint_takes(job_id, params, tmpdir, gen_start, start, end):
+    """Generate REPAINT_TAKES sequential single-batch takes (no best-of-N scoring:
+    the user picks). Each take is uploaded; returns {"takes": [...]}."""
+    from acestep.inference import GenerationConfig, generate_music
+    takes = []
+    for i in range(REPAINT_TAKES):
+        cfg = GenerationConfig(batch_size=1, use_random_seed=True, seeds=None,
+                               audio_format=AUDIO_FORMAT)
+        res = generate_music(dit_handler=_dit_handler, llm_handler=_llm_handler,
+                             params=params, config=cfg, save_dir=os.path.join(tmpdir, f"take{i}"))
+        if not res or not res.success or not res.audios:
+            logger.warning(f"[job:{job_id}] repaint take {i+1} failed: {getattr(res, 'error', None)}")
+            continue
+        path = res.audios[0].get("path", "")
+        if not path or not os.path.exists(path):
+            continue
+        ext = os.path.splitext(path)[1].lstrip(".") or AUDIO_FORMAT
+        key = f"generated/{uuid.uuid4()}.{ext}"
+        url = upload_to_s3(path, key)
+        takes.append({"audio_url": url, "s3_key": key,
+                      "seed": res.audios[0].get("params", {}).get("seed")})
+    gen_time = round(time.time() - gen_start, 2)
+    if not takes:
+        return {"error": "Repaint produced no audio", "generation_time": gen_time}
+    logger.info(f"[job:{job_id}] repaint {len(takes)} takes in {gen_time}s")
+    # audio_url/s3_key mirror take 1 so generic "COMPLETED without audio" checks pass.
+    return {"task_type": "repaint", "takes": takes, "audio_url": takes[0]["audio_url"],
+            "s3_key": takes[0]["s3_key"], "repainting_start": start, "repainting_end": end,
+            "generation_time": gen_time}
 
 
 def handler(job):
