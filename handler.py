@@ -677,7 +677,9 @@ def _handle_job(job):
                 use_cot_language=False,
                 reference_audio=local_ref_audio,
                 src_audio=local_src_audio,
-                audio_cover_strength=audio_cover_strength,
+                # <1.0 swaps to silence-src conditioning for the late steps, which would
+                # drop the surrounding song as context for the repainted region.
+                audio_cover_strength=1.0 if task_type == "repaint" else audio_cover_strength,
                 **(_repaint_kwargs(repaint_start, repaint_end) if task_type == "repaint" else {}),
             )
 
