@@ -493,6 +493,40 @@ def upload_to_s3(local_path: str, object_key: str) -> str:
     return url
 
 
+_GPU_HUNG = False  # set when a generation thread overran GENERATION_TIMEOUT
+
+
+def _run_with_timeout(fn):
+    """Run fn() with GENERATION_TIMEOUT. On overrun raise TimeoutError WITHOUT waiting
+    for the thread (`with ThreadPoolExecutor` waits on exit, which made the old timeout a
+    no-op) and mark the worker so handler() asks RunPod to recycle it — the hung thread
+    still holds the GPU."""
+    global _GPU_HUNG
+    if GENERATION_TIMEOUT <= 0:
+        return fn()
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        return ex.submit(fn).result(timeout=GENERATION_TIMEOUT)
+    except concurrent.futures.TimeoutError:
+        _GPU_HUNG = True
+        raise
+    finally:
+        ex.shutdown(wait=False)
+
+
+DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "60"))
+
+
+def _download(url: str, path: str) -> None:
+    """urlretrieve has no timeout: a stalled R2 read would hold the only worker until
+    RunPod's 900 s execution kill while every song queues behind it. `timeout` bounds
+    the connect and each read (a slow-but-moving download still completes)."""
+    import shutil
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as r, open(path, "wb") as f:
+        shutil.copyfileobj(r, f, 1 << 16)
+
+
 def _handle_job(job):
     """
     Runs one generation job (wrapped by `handler`, which adds the VRAM floor check).
@@ -606,7 +640,7 @@ def _handle_job(job):
                 try:
                     import urllib.request
                     ref_path = os.path.join(tmpdir, "reference.wav")
-                    urllib.request.urlretrieve(reference_audio_url, ref_path)
+                    _download(reference_audio_url, ref_path)
                     ref_size = os.path.getsize(ref_path)
                     logger.info(f"[job:{job_id}] Voice ref downloaded ({ref_size//1024}KB)")
                     # Validate: must be >= 10KB and start with RIFF header
@@ -631,7 +665,7 @@ def _handle_job(job):
                     return {"error": "repaint requires src_audio_url", "generation_time": 0}
                 import urllib.request
                 src_path = os.path.join(tmpdir, "source_audio.mp3")
-                urllib.request.urlretrieve(src_audio_url, src_path)
+                _download(src_audio_url, src_path)
                 if os.path.getsize(src_path) < 10_000:
                     return {"error": "repaint source audio too small", "generation_time": 0}
                 local_src_audio = src_path
@@ -643,7 +677,7 @@ def _handle_job(job):
                 try:
                     import urllib.request
                     src_path = os.path.join(tmpdir, "source_audio.mp3")
-                    urllib.request.urlretrieve(src_audio_url, src_path)
+                    _download(src_audio_url, src_path)
                     src_size = os.path.getsize(src_path)
                     logger.info(f"[job:{job_id}] Source audio downloaded ({src_size//1024}KB) for cover mode")
                     if src_size >= 10_000:
@@ -732,16 +766,13 @@ def _handle_job(job):
 
                 # Run with timeout
                 cand_result = None
-                if GENERATION_TIMEOUT > 0:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                        future = executor.submit(_run_generation)
-                        try:
-                            cand_result = future.result(timeout=GENERATION_TIMEOUT)
-                        except concurrent.futures.TimeoutError:
-                            logger.error(f"[job:{job_id}] Candidate {cand_idx+1}/{num_candidates} timed out")
-                            continue
-                else:
-                    cand_result = _run_generation()
+                try:
+                    cand_result = _run_with_timeout(_run_generation)
+                except concurrent.futures.TimeoutError:
+                    # The hung thread still owns the GPU: stop here, keep any finished
+                    # candidate, and let handler() recycle the worker.
+                    logger.error(f"[job:{job_id}] Candidate {cand_idx+1}/{num_candidates} timed out")
+                    break
 
                 if not cand_result or not cand_result.success or not cand_result.audios:
                     logger.warning(f"[job:{job_id}] Candidate {cand_idx+1}/{num_candidates} failed")
@@ -976,8 +1007,14 @@ def _run_repaint_takes(job_id, params, tmpdir, gen_start, start, end):
     for i in range(REPAINT_TAKES):
         cfg = GenerationConfig(batch_size=1, use_random_seed=True, seeds=None,
                                audio_format=AUDIO_FORMAT)
-        res = generate_music(dit_handler=_dit_handler, llm_handler=_llm_handler,
-                             params=params, config=cfg, save_dir=os.path.join(tmpdir, f"take{i}"))
+        run = lambda: generate_music(dit_handler=_dit_handler, llm_handler=_llm_handler,
+                                     params=params, config=cfg, save_dir=os.path.join(tmpdir, f"take{i}"))
+        try:
+            # Same guard as song candidates: a hung take must not hold the only worker.
+            res = _run_with_timeout(run)
+        except concurrent.futures.TimeoutError:
+            logger.error(f"[job:{job_id}] repaint take {i+1} timed out")
+            break
         if not res or not res.success or not res.audios:
             logger.warning(f"[job:{job_id}] repaint take {i+1} failed: {getattr(res, 'error', None)}")
             continue
@@ -1003,7 +1040,7 @@ def handler(job):
     """RunPod serverless handler. Returns the job result; adds `refresh_worker` (the SDK
     stops this worker after delivering the result) when VRAM stays below the floor."""
     result = _handle_job(job)
-    if isinstance(result, dict) and _below_vram_floor(job.get("id", "unknown")):
+    if isinstance(result, dict) and (_GPU_HUNG or _below_vram_floor(job.get("id", "unknown"))):
         result["refresh_worker"] = True
     return result
 
